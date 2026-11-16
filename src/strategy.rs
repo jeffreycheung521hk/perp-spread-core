@@ -2,34 +2,122 @@ use crate::fixed::{add, ceil_div, floor_div, mul, sub, BPS_DENOMINATOR, MICRO};
 use crate::{Bps, Cash, CoreError, FeeRate, Fill, OrderBook, Quantity, Result, Side, Venue};
 
 #[derive(Debug, Clone, Copy)]
+pub enum Sizing {
+    Auto { budget: Cash },
+    Fixed(Quantity),
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct QuoteRequest {
-    pub budget_per_leg: Cash,
+    pub sizing: Sizing,
     pub quantity_step: Quantity,
-    pub quantity: Option<Quantity>,
     pub long_fee: FeeRate,
     pub short_fee: FeeRate,
 }
 
+/// An immutable quote; external callers can inspect but cannot rewrite its size.
+///
+/// ```compile_fail,E0616
+/// use perp_spread_core::{Quantity, Quote};
+/// fn tamper(quote: &mut Quote, new_size: Quantity) {
+///     quote.quantity = new_size;
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Quote {
-    pub long_venue: Venue,
-    pub short_venue: Venue,
-    pub quantity: Quantity,
-    pub long_buy: Fill,
-    pub short_sell: Fill,
-    pub long_sell: Fill,
-    pub short_buy: Fill,
-    pub entry_fees: Cash,
-    pub estimated_exit_fees: Cash,
-    pub entry_credit_bps: Bps,
-    pub exit_debit_bps: Bps,
-    pub round_trip_fee_bps: Bps,
-    pub max_walk_slippage_bps: Bps,
-    pub long_spread_bps: Bps,
-    pub short_spread_bps: Bps,
-    pub long_received_ms: u64,
-    pub short_received_ms: u64,
+    long_venue: Venue,
+    short_venue: Venue,
+    quantity: Quantity,
+    long_buy: Fill,
+    short_sell: Fill,
+    long_sell: Fill,
+    short_buy: Fill,
+    entry_fees: Cash,
+    estimated_exit_fees: Cash,
+    entry_credit_bps: Bps,
+    exit_debit_bps: Bps,
+    round_trip_fee_bps: Bps,
+    max_walk_slippage_bps: Bps,
+    long_spread_bps: Bps,
+    short_spread_bps: Bps,
+    long_received_ms: u64,
+    short_received_ms: u64,
     reference_notional_times_four: i128,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExitRequest {
+    pub quantity: Quantity,
+    pub long_fee: FeeRate,
+    pub short_fee: FeeRate,
+}
+
+/// Only the long venue's bids and short venue's asks enter this estimate.
+///
+/// ```compile_fail,E0616
+/// use perp_spread_core::{ExitQuote, Quantity};
+/// fn tamper(exit: &mut ExitQuote, entry_size: Quantity) {
+///     exit.quantity = entry_size;
+/// }
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ExitQuote {
+    long_venue: Venue,
+    short_venue: Venue,
+    quantity: Quantity,
+    long_sell: Fill,
+    short_buy: Fill,
+    fees: Cash,
+    long_received_ms: u64,
+    short_received_ms: u64,
+}
+impl ExitQuote {
+    pub fn long_venue(&self) -> Venue {
+        self.long_venue
+    }
+    pub fn short_venue(&self) -> Venue {
+        self.short_venue
+    }
+    pub fn quantity(&self) -> Quantity {
+        self.quantity
+    }
+    pub fn long_sell(&self) -> Fill {
+        self.long_sell
+    }
+    pub fn short_buy(&self) -> Fill {
+        self.short_buy
+    }
+    pub fn fees(&self) -> Cash {
+        self.fees
+    }
+    pub fn long_received_ms(&self) -> u64 {
+        self.long_received_ms
+    }
+    pub fn short_received_ms(&self) -> u64 {
+        self.short_received_ms
+    }
+}
+
+pub fn quote_exit(long: &OrderBook, short: &OrderBook, request: ExitRequest) -> Result<ExitQuote> {
+    if long.venue() == short.venue() {
+        return Err(CoreError::Invalid("same venue on both legs"));
+    }
+    let long_sell = long.walk(Side::Sell, request.quantity)?;
+    let short_buy = short.walk(Side::Buy, request.quantity)?;
+    let fees = request
+        .long_fee
+        .charge(long_sell.notional)?
+        .checked_add(request.short_fee.charge(short_buy.notional)?)?;
+    Ok(ExitQuote {
+        long_venue: long.venue(),
+        short_venue: short.venue(),
+        quantity: request.quantity,
+        long_sell,
+        short_buy,
+        fees,
+        long_received_ms: long.meta()?.received_ms,
+        short_received_ms: short.meta()?.received_ms,
+    })
 }
 
 fn ratio_bps(cash: i128, reference_times_four: i128, ceil: bool) -> Result<Bps> {
@@ -45,18 +133,21 @@ pub fn quote_pair(long: &OrderBook, short: &OrderBook, request: QuoteRequest) ->
     if long.venue() == short.venue() {
         return Err(CoreError::Invalid("same venue on both legs"));
     }
-    if request.quantity_step.is_zero() || request.budget_per_leg.0 <= 0 {
-        return Err(CoreError::Invalid("budget or quantity step"));
+    if request.quantity_step.is_zero() {
+        return Err(CoreError::Invalid("zero quantity step"));
     }
     let (lb, la) = long.best()?;
     let (sb, sa) = short.best()?;
     // Reference price is the average of the four best quotes. Keep the exact
     // denominator rather than rounding this reference to a price tick.
     let price_sum = add(add(lb.0, la.0)?, add(sb.0, sa.0)?)?;
-    let quantity = match request.quantity {
-        Some(q) => q,
-        None => {
-            let raw = floor_div(mul(request.budget_per_leg.0, 4)?, price_sum)?;
+    let quantity = match request.sizing {
+        Sizing::Fixed(q) => q,
+        Sizing::Auto { budget } => {
+            if budget.0 <= 0 {
+                return Err(CoreError::Invalid("non-positive budget"));
+            }
+            let raw = floor_div(mul(budget.0, 4)?, price_sum)?;
             Quantity(mul(raw / request.quantity_step.0, request.quantity_step.0)?)
         }
     };
@@ -158,6 +249,70 @@ pub struct Decision {
     pub reason: &'static str,
 }
 impl Quote {
+    pub fn long_venue(&self) -> Venue {
+        self.long_venue
+    }
+    pub fn short_venue(&self) -> Venue {
+        self.short_venue
+    }
+    pub fn quantity(&self) -> Quantity {
+        self.quantity
+    }
+    pub fn long_buy(&self) -> Fill {
+        self.long_buy
+    }
+    pub fn short_sell(&self) -> Fill {
+        self.short_sell
+    }
+    pub fn long_sell(&self) -> Fill {
+        self.long_sell
+    }
+    pub fn short_buy(&self) -> Fill {
+        self.short_buy
+    }
+    pub fn entry_fees(&self) -> Cash {
+        self.entry_fees
+    }
+    pub fn estimated_exit_fees(&self) -> Cash {
+        self.estimated_exit_fees
+    }
+    pub fn entry_credit_bps(&self) -> Bps {
+        self.entry_credit_bps
+    }
+    pub fn exit_debit_bps(&self) -> Bps {
+        self.exit_debit_bps
+    }
+    pub fn round_trip_fee_bps(&self) -> Bps {
+        self.round_trip_fee_bps
+    }
+    pub fn max_walk_slippage_bps(&self) -> Bps {
+        self.max_walk_slippage_bps
+    }
+    pub fn long_spread_bps(&self) -> Bps {
+        self.long_spread_bps
+    }
+    pub fn short_spread_bps(&self) -> Bps {
+        self.short_spread_bps
+    }
+    pub fn long_received_ms(&self) -> u64 {
+        self.long_received_ms
+    }
+    pub fn short_received_ms(&self) -> u64 {
+        self.short_received_ms
+    }
+    /// Reuse an existing pair quote's exit half without re-walking either side.
+    pub fn exit_quote(&self) -> ExitQuote {
+        ExitQuote {
+            long_venue: self.long_venue,
+            short_venue: self.short_venue,
+            quantity: self.quantity,
+            long_sell: self.long_sell,
+            short_buy: self.short_buy,
+            fees: self.estimated_exit_fees,
+            long_received_ms: self.long_received_ms,
+            short_received_ms: self.short_received_ms,
+        }
+    }
     /// A signal only. It does not submit orders or guarantee future execution.
     pub fn assess(&self, previous_exit_ema: Bps, now_ms: u64, policy: Policy) -> Result<Decision> {
         policy.validate()?;
@@ -210,7 +365,7 @@ pub struct ClosedTrade {
 }
 impl OpenPosition {
     /// Estimate a closing result, without mutating/closing a real account.
-    pub fn mark_close(&self, exit: &Quote) -> Result<ClosedTrade> {
+    pub fn mark_close(&self, exit: &ExitQuote) -> Result<ClosedTrade> {
         let entry = &self.entry;
         if exit.quantity != entry.quantity
             || exit.long_venue != entry.long_venue
@@ -229,7 +384,7 @@ impl OpenPosition {
                     .checked_sub(exit.short_buy.notional)?,
             )?;
         // Use the supplied exit quote's fee rates: tiers may change after entry.
-        let fees = entry.entry_fees.checked_add(exit.estimated_exit_fees)?;
+        let fees = entry.entry_fees.checked_add(exit.fees)?;
         let net = gross.checked_sub(fees)?;
         Ok(ClosedTrade {
             gross,

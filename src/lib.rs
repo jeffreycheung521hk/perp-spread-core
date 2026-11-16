@@ -5,10 +5,11 @@ mod book;
 mod fixed;
 mod strategy;
 
-pub use book::{Fill, Level, OrderBook, Side, UpdateMeta, Venue};
+pub use book::{BookState, Fill, Level, OrderBook, Side, UpdateMeta, UpdateOutcome, Venue};
 pub use fixed::{Bps, Cash, FeeRate, Price, Quantity};
 pub use strategy::{
-    quote_pair, ClosedTrade, Decision, Ema, OpenPosition, Policy, Quote, QuoteRequest,
+    quote_exit, quote_pair, ClosedTrade, Decision, Ema, ExitQuote, ExitRequest, OpenPosition,
+    Policy, Quote, QuoteRequest, Sizing,
 };
 
 pub type Result<T> = std::result::Result<T, CoreError>;

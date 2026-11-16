@@ -8,12 +8,15 @@ The first version models a SOL-sized pair between Hyperliquid and dYdX. It recon
 
 [繁體中文說明](docs/README.zh-TW.md) · [TSV interface](docs/PROTOCOL.md) · [Validation snapshot](docs/VALIDATION.md)
 
+[API migration and book-state rules](docs/MIGRATION.md) · [Remaining review items](docs/REVIEW_FOLLOWUPS.md)
+
 ## Quick start
 
 Install Rust, then run from the repository root:
 
 ```bash
 cargo test --locked --offline --all-targets
+cargo test --locked --offline --doc
 cargo run --locked --offline -- --demo
 ```
 
@@ -41,7 +44,9 @@ Python 3.9+ is sufficient; the verification script also uses only the standard l
 
 Buying walks asks from low to high; selling walks bids from high to low. If the first 20 levels cannot fill the whole requested size, the calculation returns an error. A higher ask alone is not treated as a profitable short-sale opportunity.
 
-Both legs use the same base-asset quantity. If quantity is automatic, the budget divided by the average of the four best quotes determines a size, rounded down to the configured step. If quantity is supplied explicitly, it overrides budget-based sizing, which is useful when estimating closure of an existing pair. Prices and sizes must be expressed in consistent USD/base units by the caller; the library does not fetch or validate exchange contract specifications.
+Both legs use the same base-asset quantity. `Sizing::Auto { budget }` divides the budget by the average of the four best quotes, then rounds size down to the configured step. `Sizing::Fixed(quantity)` has no budget parameter. For an existing position, use `quote_exit` with `ExitRequest`: it walks only the long venue's bids and short venue's asks, without depending on entry-side depth, a sizing budget, or an entry quantity step. Prices and sizes must use consistent USD/base units; adapters must validate exchange contract specifications.
+
+`Quote`, `ExitQuote`, and `Fill` expose getters rather than writable fields. `OpenPosition::mark_close` accepts an immutable `ExitQuote` and rejects a different quantity or venue direction. `Quote::exit_quote()` can reuse the exit half of a pair quote that was already computed.
 
 ## Cost and P&L definitions
 
@@ -71,13 +76,17 @@ The sample 4.5/5 bps fees and policy thresholds are **illustrative inputs**, not
 - Exact decimal strings enter checked `i128` arithmetic; there is no financial `f64` calculation.
 - Excess precision, scientific notation, non-finite values, invalid signs, zero trade size and arithmetic overflow return explicit errors.
 - Fees round upward by less than one cash atom per fill. Positive edge is rounded down; estimated costs and slippage are rounded up at micro-bp precision.
-- EMA rounds its estimated cost upward at micro-bp precision. It is an approximation and returns the estimate from **before** incorporating the current observation. The caller controls sampling cadence, warmup usage, and resets after gaps.
+- EMA rounds its estimated cost upward at micro-bp precision. It is an approximation and returns the estimate from **before** incorporating the current observation. Maintain separate EMA histories per instrument, venue direction and order-size policy; never mix opposite directions or materially different sizes. The caller controls cadence, warmup and resets after gaps. Very small alpha can make decay stall; this numeric limitation remains tracked in the follow-ups.
 
 ## Data validity and scope
 
-`OrderBook::apply` supports snapshots, incremental price-level updates, and zero-size deletion. Rejected updates invalidate the previous book. A new snapshot is then required. Provided duplicate/backward message IDs, backward source timestamps, and backward arrival times are rejected.
+`OrderBook::apply` supports snapshots, deltas and zero-size deletion. It returns `UpdateOutcome::Applied` or `Ignored`. Crossed depth is retained in `BookState::Crossed`: `best`/`walk` reject it, but subsequent deltas can uncross it without resubscribing. `Synced` describes the stream baseline and may have an empty side; quoting still requires the relevant executable depth.
 
-Both venues' `received_ms` values must use the same local monotonic clock. `Quote::assess` filters future/stale arrivals, pair skew, venue spread, walked slippage and insufficient estimated net edge. The caller is responsible for source-data age, clock synchronization, venue-specific message-ID semantics and sequence-gap detection. The library does not claim that receipt time equals exchange matching time.
+A validated snapshot starts a new message-ID sequence, including when its ID is `None`. Within that sequence, duplicate/backward delta IDs are ignored without changing depth, source watermark or arrival time. Source/arrival watermarks survive snapshots and explicit `invalidate()`. Rejected input leaves the last accepted state unchanged. Duplicate prices in a snapshot are rejected atomically. Call `invalidate()` on disconnect/gap; adapters must reject late messages from retired connection IDs. Construct a new book when changing instrument or clock domain.
+
+Both venues' `received_ms` values must use the same local monotonic clock. They mark the last applied book event, not transport liveness. Ignored duplicates do not refresh them. An empty delta can represent an explicitly confirmed valid book event; adapters must not invent empty deltas from a network ping just to bypass age checks. Quiet healthy books may fail these illustrative age thresholds, so transport liveness and quote freshness need separate adapter policies.
+
+`Quote::assess` filters future/stale arrivals, pair skew, venue spread, walked slippage and insufficient estimated net edge. Adapters must check source-data age, clock synchronization, connection identity and sequence gaps. Source-order protection applies when a source timestamp is provided; arrival time alone cannot prove source freshness. The current policy defaults are examples, not validated Hyperliquid/dYdX feed-cadence settings. See the migration note for the official documentation checked and remaining cadence uncertainty.
 
 This version does **not** implement:
 
@@ -96,11 +105,12 @@ This version does **not** implement:
 cargo fmt --all -- --check
 cargo clippy --locked --offline --all-targets -- -D warnings
 cargo test --locked --offline --all-targets
+cargo test --locked --offline --doc
 cargo build --locked --offline --release
 python3 scripts/check_python_parity.py --binary target/release/spread-core
 ```
 
-GitHub Actions runs these checks on pushes to `main` and on pull requests. The Python reference verifies quote arithmetic and filters; it is not a full replay of the previous Python paper-trading engine. Rust regression tests separately cover EMA ordering and hypothetical trade reconciliation.
+GitHub Actions runs these checks on pushes to `main` and on pull requests. The Python reference verifies quote arithmetic and the filter branches actually sampled by its fixtures; it is not a full replay of the earlier Python engine. Its current fixtures do not cross-validate the `walk_slippage` and `venue_spread` rejection branches, although Rust tests cover both. Run it without Python optimization because its assertions are currently required; replacing them with optimization-safe checks remains tracked. Rust regression and compile-fail tests separately cover book state, exit estimation, byte framing, immutability, EMA ordering and trade reconciliation.
 
 ## License
 

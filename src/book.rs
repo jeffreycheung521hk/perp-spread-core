@@ -1,6 +1,6 @@
 use crate::fixed::{add, ceil_div, display_scaled, mul, sub, BPS_DENOMINATOR, MICRO};
 use crate::{Bps, Cash, CoreError, Price, Quantity, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Venue {
@@ -35,12 +35,26 @@ pub struct UpdateMeta {
     pub source_ms: Option<u64>,
 }
 
+/// Immutable walked fill. It can only be produced by the book walker.
+///
+/// ```compile_fail,E0616
+/// use perp_spread_core::{Cash, Fill};
+/// fn tamper(fill: &mut Fill, fake_notional: Cash) {
+///     fill.notional = fake_notional;
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Fill {
-    pub quantity: Quantity,
-    pub notional: Cash,
+    pub(crate) quantity: Quantity,
+    pub(crate) notional: Cash,
 }
 impl Fill {
+    pub fn quantity(self) -> Quantity {
+        self.quantity
+    }
+    pub fn notional(self) -> Cash {
+        self.notional
+    }
     /// Display only: accounting keeps the exact notional.
     pub fn vwap_string(self) -> Result<String> {
         if self.quantity.is_zero() || self.notional.0 <= 0 {
@@ -53,12 +67,29 @@ impl Fill {
     }
 }
 
+/// Stream synchronization is separate from the availability of executable depth.
+/// `Synced` may have an empty side; the relevant quote/walk then returns EmptyBook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookState {
+    NeedsSnapshot,
+    Synced,
+    Crossed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    Applied,
+    Ignored,
+}
+
 #[derive(Debug)]
 pub struct OrderBook {
     venue: Venue,
     bids: BTreeMap<Price, Quantity>,
     asks: BTreeMap<Price, Quantity>,
     meta: Option<UpdateMeta>,
+    state: BookState,
+    last_received_ms: Option<u64>,
     last_source_ms: Option<u64>,
     last_message_id: Option<u64>,
 }
@@ -69,6 +100,8 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             meta: None,
+            state: BookState::NeedsSnapshot,
+            last_received_ms: None,
             last_source_ms: None,
             last_message_id: None,
         }
@@ -76,48 +109,50 @@ impl OrderBook {
     pub fn venue(&self) -> Venue {
         self.venue
     }
+    pub fn state(&self) -> BookState {
+        self.state
+    }
+    pub fn source_watermark_ms(&self) -> Option<u64> {
+        self.last_source_ms
+    }
+    /// Discard depth and end the sequence, but retain source/arrival watermarks.
+    /// Construct a new book only when intentionally changing clock/instrument.
     pub fn invalidate(&mut self) {
         self.bids.clear();
         self.asks.clear();
         self.meta = None;
-        self.last_source_ms = None;
+        self.state = BookState::NeedsSnapshot;
         self.last_message_id = None;
     }
     pub fn meta(&self) -> Result<UpdateMeta> {
         self.meta.ok_or(CoreError::MissingSnapshot)
     }
 
-    /// Zero size deletes a level. Any rejected update invalidates the old book.
+    /// A validated snapshot starts a new sequence, even when its ID is None.
+    /// Old/duplicate delta IDs are ignored without refreshing timestamps.
+    /// Crossed depth is retained; quote methods stay disabled until it uncrosses.
+    /// Errors leave the previously accepted book and watermarks unchanged.
     pub fn apply(
         &mut self,
         snapshot: bool,
         bids: &[Level],
         asks: &[Level],
         meta: UpdateMeta,
-    ) -> Result<()> {
-        let result = self.apply_inner(snapshot, bids, asks, meta);
-        if result.is_err() {
-            self.invalidate();
-        }
-        result
-    }
-    fn apply_inner(
-        &mut self,
-        snapshot: bool,
-        bids: &[Level],
-        asks: &[Level],
-        meta: UpdateMeta,
-    ) -> Result<()> {
-        if !snapshot && self.meta.is_none() {
+    ) -> Result<UpdateOutcome> {
+        if !snapshot && self.state == BookState::NeedsSnapshot {
             return Err(CoreError::MissingSnapshot);
         }
-        if self
-            .meta
-            .is_some_and(|last| meta.received_ms < last.received_ms)
-            || self
+        if !snapshot
+            && self
                 .last_message_id
                 .zip(meta.message_id)
                 .is_some_and(|(a, b)| b <= a)
+        {
+            return Ok(UpdateOutcome::Ignored);
+        }
+        if self
+            .last_received_ms
+            .is_some_and(|last| meta.received_ms < last)
             || self
                 .last_source_ms
                 .zip(meta.source_ms)
@@ -126,6 +161,8 @@ impl OrderBook {
             return Err(CoreError::OutOfOrder);
         }
         if snapshot {
+            validate_snapshot_levels(bids)?;
+            validate_snapshot_levels(asks)?;
             self.bids.clear();
             self.asks.clear();
         }
@@ -138,23 +175,38 @@ impl OrderBook {
                 }
             }
         }
-        self.best()?;
         self.meta = Some(meta);
+        self.last_received_ms = Some(meta.received_ms);
         if meta.source_ms.is_some() {
             self.last_source_ms = meta.source_ms;
         }
-        if meta.message_id.is_some() {
+        if snapshot || meta.message_id.is_some() {
             self.last_message_id = meta.message_id;
         }
-        Ok(())
+        self.state = match (self.bids.last_key_value(), self.asks.first_key_value()) {
+            (Some((bid, _)), Some((ask, _))) if bid >= ask => BookState::Crossed,
+            _ => BookState::Synced,
+        };
+        Ok(UpdateOutcome::Applied)
+    }
+    fn ensure_quotable(&self) -> Result<()> {
+        match self.state {
+            BookState::NeedsSnapshot => Err(CoreError::MissingSnapshot),
+            BookState::Crossed => Err(CoreError::CrossedBook),
+            BookState::Synced => Ok(()),
+        }
+    }
+    /// Best price for just the executable side; the unused side may be empty.
+    pub fn best_price(&self, side: Side) -> Result<Price> {
+        self.ensure_quotable()?;
+        let level = match side {
+            Side::Buy => self.asks.first_key_value(),
+            Side::Sell => self.bids.last_key_value(),
+        };
+        level.map(|(price, _)| *price).ok_or(CoreError::EmptyBook)
     }
     pub fn best(&self) -> Result<(Price, Price)> {
-        let bid = self.bids.last_key_value().ok_or(CoreError::EmptyBook)?.0;
-        let ask = self.asks.first_key_value().ok_or(CoreError::EmptyBook)?.0;
-        if bid >= ask {
-            return Err(CoreError::CrossedBook);
-        }
-        Ok((*bid, *ask))
+        Ok((self.best_price(Side::Sell)?, self.best_price(Side::Buy)?))
     }
     pub fn spread_bps(&self) -> Result<Bps> {
         let (bid, ask) = self.best()?;
@@ -164,8 +216,7 @@ impl OrderBook {
         )?))
     }
     pub fn walk(&self, side: Side, quantity: Quantity) -> Result<Fill> {
-        self.meta()?;
-        self.best()?;
+        self.best_price(side)?;
         if quantity.is_zero() {
             return Err(CoreError::Invalid("zero trade size"));
         }
@@ -178,14 +229,7 @@ impl OrderBook {
         if fill.quantity.is_zero() || fill.notional.0 <= 0 {
             return Err(CoreError::Invalid("non-positive fill"));
         }
-        let (bid, ask) = self.best()?;
-        let best_cash = mul(
-            match side {
-                Side::Buy => ask.0,
-                Side::Sell => bid.0,
-            },
-            fill.quantity.0,
-        )?;
+        let best_cash = mul(self.best_price(side)?.0, fill.quantity.0)?;
         let cost = match side {
             Side::Buy => sub(fill.notional.0, best_cash)?,
             Side::Sell => sub(best_cash, fill.notional.0)?,
@@ -195,6 +239,16 @@ impl OrderBook {
         }
         Ok(Bps(ceil_div(mul(cost, BPS_DENOMINATOR)?, best_cash)?))
     }
+}
+
+fn validate_snapshot_levels(levels: &[Level]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for level in levels {
+        if !seen.insert(level.price) {
+            return Err(CoreError::Invalid("duplicate snapshot price"));
+        }
+    }
+    Ok(())
 }
 
 fn walk_levels<'a>(

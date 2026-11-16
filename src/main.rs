@@ -49,12 +49,13 @@ fn process(line: &str) -> Result<String> {
         &long,
         &short,
         QuoteRequest {
-            quantity: if f[2] == "auto" {
-                None
+            sizing: if f[2] == "auto" {
+                Sizing::Auto {
+                    budget: Cash::parse(f[3])?,
+                }
             } else {
-                Some(Quantity::parse(f[2])?)
+                Sizing::Fixed(Quantity::parse(f[2])?)
             },
-            budget_per_leg: Cash::parse(f[3])?,
             quantity_step: Quantity::parse(f[4])?,
             long_fee: FeeRate::parse(f[5])?,
             short_fee: FeeRate::parse(f[6])?,
@@ -66,19 +67,19 @@ fn process(line: &str) -> Result<String> {
         ..Policy::default()
     };
     let decision = quote.assess(Bps::parse(f[7])?, number(f[10])?, policy)?;
-    let immediate = quote.paper_open().mark_close(&quote)?;
+    let immediate = quote.paper_open().mark_close(&quote.exit_quote())?;
     Ok([
         f[0].to_owned(),
         "OK".to_owned(),
-        quote.quantity.to_string(),
-        quote.entry_credit_bps.to_string(),
-        quote.exit_debit_bps.to_string(),
-        quote.round_trip_fee_bps.to_string(),
-        quote.max_walk_slippage_bps.to_string(),
-        quote.long_buy.vwap_string()?,
-        quote.short_sell.vwap_string()?,
-        quote.long_sell.vwap_string()?,
-        quote.short_buy.vwap_string()?,
+        quote.quantity().to_string(),
+        quote.entry_credit_bps().to_string(),
+        quote.exit_debit_bps().to_string(),
+        quote.round_trip_fee_bps().to_string(),
+        quote.max_walk_slippage_bps().to_string(),
+        quote.long_buy().vwap_string()?,
+        quote.short_sell().vwap_string()?,
+        quote.long_sell().vwap_string()?,
+        quote.short_buy().vwap_string()?,
         decision.estimated_net_bps.to_string(),
         decision.eligible.to_string(),
         decision.reason.to_owned(),
@@ -115,15 +116,22 @@ fn demo() -> Result<()> {
     let long = snapshot(Venue::Hyperliquid, "99.99@100", "100.01@100", 1000)?;
     let short = snapshot(Venue::Dydx, "100.39@100", "100.41@100", 1000)?;
     let request = QuoteRequest {
-        budget_per_leg: Cash::parse("1000")?,
+        sizing: Sizing::Fixed(Quantity::parse("10")?),
         quantity_step: Quantity::parse("0.001")?,
-        quantity: Some(Quantity::parse("10")?),
         long_fee: FeeRate::parse("4.5")?,
         short_fee: FeeRate::parse("5")?,
     };
     let entry = quote_pair(&long, &short, request)?;
     let short_after = snapshot(Venue::Dydx, "99.99@100", "100.01@100", 4000)?;
-    let exit = quote_pair(&long, &short_after, request)?;
+    let exit = quote_exit(
+        &long,
+        &short_after,
+        ExitRequest {
+            quantity: entry.quantity(),
+            long_fee: request.long_fee,
+            short_fee: request.short_fee,
+        },
+    )?;
     let pnl = entry.paper_open().mark_close(&exit)?;
     println!(
         "Hypothetical 10-SOL pair: gross USD {}, four fees USD {}, net USD {}",
@@ -138,16 +146,35 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
     let stdin = io::stdin();
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.is_empty() {
-            continue;
+    let mut input = stdin.lock();
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if input.read_until(b'\n', &mut bytes)? == 0 {
+            break;
         }
-        let id = line.split('\t').next().unwrap_or("unknown");
-        match process(&line) {
-            Ok(result) => writeln!(stdout, "{result}")?,
-            Err(error) => writeln!(stdout, "{id}\tERR\t{error}")?,
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
         }
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        let response = match std::str::from_utf8(&bytes) {
+            Err(_) => "unknown\tERR\tinvalid UTF-8 input".to_owned(),
+            Ok("") => "unknown\tERR\tempty request".to_owned(),
+            Ok(line) => {
+                let id = line
+                    .split('\t')
+                    .next()
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or("unknown");
+                match process(line) {
+                    Ok(result) => result,
+                    Err(error) => format!("{id}\tERR\t{error}"),
+                }
+            }
+        };
+        writeln!(stdout, "{response}")?;
         stdout.flush()?;
     }
     Ok(())

@@ -145,7 +145,7 @@ def main():
         assert D(row[14])-D(row[15]) == D(row[16])
         successes += 1
     print(f"PASS: {len(cases)} synthetic cases; {successes} quote comparisons, {errors} expected errors.")
-    print("VWAP, four fees, conservative bps rounding, filters, and cash reconciliation verified.")
+    print("VWAP, four fees, conservative bps rounding, sampled filters, and cash reconciliation verified.")
 
 
 if __name__ == "__main__":
