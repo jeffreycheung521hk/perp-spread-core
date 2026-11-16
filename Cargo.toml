@@ -1,0 +1,17 @@
+[package]
+name = "perp-spread-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Deterministic order-book and cost analysis for cross-exchange perpetual futures research"
+
+[lib]
+name = "perp_spread_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spread-core"
+path = "src/main.rs"
+
+[profile.release]
+overflow-checks = true

@@ -1,0 +1,36 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install stable Rust and checks
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+      - name: Run Clippy
+        run: cargo +stable clippy --locked --offline --all-targets -- -D warnings
+      - name: Run Rust tests
+        run: cargo +stable test --locked --offline --all-targets
+      - name: Build release binary
+        run: cargo +stable build --locked --offline --release
+      - name: Compare with independent Python Decimal reference
+        run: python3 scripts/check_python_parity.py --binary target/release/spread-core
+      - name: Run synthetic demonstration
+        run: ./target/release/spread-core --demo
