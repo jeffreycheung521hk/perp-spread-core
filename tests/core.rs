@@ -23,9 +23,13 @@ fn flat(venue: Venue) -> OrderBook {
 }
 fn request(quantity: Option<&str>) -> QuoteRequest {
     QuoteRequest {
-        budget_per_leg: Cash::parse("1000").unwrap(),
+        sizing: match quantity {
+            Some(q) => Sizing::Fixed(Quantity::parse(q).unwrap()),
+            None => Sizing::Auto {
+                budget: Cash::parse("1000").unwrap(),
+            },
+        },
         quantity_step: Quantity::parse("0.001").unwrap(),
-        quantity: quantity.map(|q| Quantity::parse(q).unwrap()),
         long_fee: FeeRate::parse("4.5").unwrap(),
         short_fee: FeeRate::parse("5").unwrap(),
     }
@@ -39,7 +43,7 @@ fn walks_multiple_levels_using_exact_notional() {
         &[("100.01", "1"), ("100.03", "2")],
     );
     let f = b.walk(Side::Buy, Quantity::parse("3").unwrap()).unwrap();
-    assert_eq!(f.notional, Cash::parse("300.07").unwrap());
+    assert_eq!(f.notional(), Cash::parse("300.07").unwrap());
     assert_eq!(f.vwap_string().unwrap(), "100.023333333333");
     assert_eq!(
         b.walk(Side::Buy, Quantity::parse("4").unwrap())
@@ -57,7 +61,7 @@ fn sell_walk_starts_at_the_highest_bid() {
     assert_eq!(
         b.walk(Side::Sell, Quantity::parse("2").unwrap())
             .unwrap()
-            .notional,
+            .notional(),
         Cash::parse("199.96").unwrap()
     );
 }
@@ -100,61 +104,139 @@ fn delta_before_snapshot_is_rejected() {
     );
 }
 #[test]
-fn rejected_update_invalidates_old_book_and_requires_a_new_snapshot() {
+fn crossed_updates_keep_depth_and_recover_using_deltas() {
     let mut b = flat(Venue::Dydx);
     assert_eq!(
         b.apply(false, &[Level::parse("101", "1").unwrap()], &[], meta(1001)),
-        Err(CoreError::CrossedBook)
+        Ok(UpdateOutcome::Applied)
     );
-    assert!(b.meta().is_err());
+    assert_eq!(b.state(), BookState::Crossed);
+    assert_eq!(b.best(), Err(CoreError::CrossedBook));
     assert_eq!(
-        b.apply(false, &[], &[], meta(1002)),
-        Err(CoreError::MissingSnapshot)
+        b.walk(Side::Buy, Quantity::parse("1").unwrap())
+            .unwrap_err(),
+        CoreError::CrossedBook
     );
+    b.apply(false, &[Level::parse("101", "0").unwrap()], &[], meta(1002))
+        .unwrap();
+    assert_eq!(b.state(), BookState::Synced);
+    assert_eq!(b.best().unwrap().0, Price::parse("99.99").unwrap());
+    assert!(b.walk(Side::Buy, Quantity::parse("1").unwrap()).is_ok());
+}
+#[test]
+fn duplicate_ids_are_ignored_without_data_loss_or_freshness_extension() {
+    let mut b = OrderBook::new(Venue::Dydx);
     b.apply(
         true,
         &[Level::parse("99", "1").unwrap()],
         &[Level::parse("101", "1").unwrap()],
-        meta(1003),
+        UpdateMeta {
+            message_id: Some(2),
+            source_ms: Some(200),
+            ..meta(1000)
+        },
     )
     .unwrap();
+    assert_eq!(
+        b.apply(
+            false,
+            &[],
+            &[Level::parse("101", "0").unwrap()],
+            UpdateMeta {
+                message_id: Some(2),
+                source_ms: Some(100),
+                ..meta(999)
+            }
+        ),
+        Ok(UpdateOutcome::Ignored)
+    );
+    assert_eq!(b.meta().unwrap().received_ms, 1000);
+    assert_eq!(b.source_watermark_ms(), Some(200));
+    assert_eq!(b.state(), BookState::Synced);
     assert!(b.walk(Side::Buy, Quantity::parse("1").unwrap()).is_ok());
 }
 #[test]
-fn duplicate_message_id_and_older_source_are_rejected() {
-    for (old, new) in [
-        (
-            UpdateMeta {
-                message_id: Some(2),
-                ..meta(1000)
-            },
-            UpdateMeta {
-                message_id: Some(2),
-                ..meta(1001)
-            },
-        ),
-        (
-            UpdateMeta {
-                source_ms: Some(200),
-                ..meta(1000)
-            },
-            UpdateMeta {
-                source_ms: Some(100),
-                ..meta(1001)
-            },
-        ),
+fn time_rejected_snapshots_preserve_the_synced_book_and_watermarks() {
+    for rejected in [
+        UpdateMeta {
+            message_id: Some(1),
+            source_ms: Some(100),
+            ..meta(1001)
+        },
+        UpdateMeta {
+            message_id: Some(1),
+            source_ms: Some(201),
+            ..meta(999)
+        },
     ] {
         let mut b = OrderBook::new(Venue::Dydx);
         b.apply(
             true,
             &[Level::parse("99", "1").unwrap()],
             &[Level::parse("101", "1").unwrap()],
-            old,
+            UpdateMeta {
+                message_id: Some(2),
+                source_ms: Some(200),
+                ..meta(1000)
+            },
         )
         .unwrap();
-        assert_eq!(b.apply(false, &[], &[], new), Err(CoreError::OutOfOrder));
-        assert!(b.meta().is_err());
+        assert_eq!(
+            b.apply(
+                true,
+                &[Level::parse("50", "1").unwrap()],
+                &[Level::parse("51", "1").unwrap()],
+                rejected
+            ),
+            Err(CoreError::OutOfOrder)
+        );
+        assert_eq!(b.meta().unwrap().received_ms, 1000);
+        assert_eq!(b.state(), BookState::Synced);
+        assert_eq!(b.source_watermark_ms(), Some(200));
+        assert_eq!(b.best().unwrap().0, Price::parse("99").unwrap());
+        assert_eq!(
+            b.apply(
+                false,
+                &[],
+                &[],
+                UpdateMeta {
+                    message_id: Some(3),
+                    source_ms: Some(202),
+                    ..meta(1002)
+                }
+            ),
+            Ok(UpdateOutcome::Applied)
+        );
     }
+}
+#[test]
+fn source_time_rejected_deltas_require_snapshot_but_keep_watermarks() {
+    let mut b = OrderBook::new(Venue::Dydx);
+    b.apply(
+        true,
+        &[Level::parse("99", "1").unwrap()],
+        &[Level::parse("101", "1").unwrap()],
+        UpdateMeta {
+            source_ms: Some(200),
+            ..meta(1000)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        b.apply(
+            false,
+            &[],
+            &[Level::parse("101", "0").unwrap()],
+            UpdateMeta {
+                source_ms: Some(100),
+                ..meta(1001)
+            }
+        ),
+        Err(CoreError::OutOfOrder)
+    );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.source_watermark_ms(), Some(200));
+    assert_eq!(b.best(), Err(CoreError::MissingSnapshot));
 }
 #[test]
 fn backwards_local_time_is_rejected() {
@@ -163,6 +245,8 @@ fn backwards_local_time_is_rejected() {
         b.apply(false, &[], &[], meta(999)),
         Err(CoreError::OutOfOrder)
     );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.meta().unwrap_err(), CoreError::MissingSnapshot);
 }
 #[test]
 fn source_order_check_survives_messages_with_missing_source_time() {
@@ -190,6 +274,8 @@ fn source_order_check_survives_messages_with_missing_source_time() {
         ),
         Err(CoreError::OutOfOrder)
     );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.source_watermark_ms(), Some(200));
 }
 #[test]
 fn only_twenty_levels_are_executable() {
@@ -218,7 +304,7 @@ fn higher_ask_alone_is_not_an_executable_edge() {
         request(None),
     )
     .unwrap();
-    assert!(q.entry_credit_bps < Bps::parse("0").unwrap());
+    assert!(q.entry_credit_bps() < Bps::parse("0").unwrap());
     assert!(
         !q.assess(Bps::parse("2").unwrap(), 1000, Policy::default())
             .unwrap()
@@ -233,9 +319,9 @@ fn four_fees_use_the_actual_fill_notionals() {
         request(Some("10")),
     )
     .unwrap();
-    assert_eq!(q.round_trip_fee_bps, Bps::parse("19").unwrap());
+    assert_eq!(q.round_trip_fee_bps(), Bps::parse("19").unwrap());
     assert_eq!(
-        q.entry_fees.checked_add(q.estimated_exit_fees).unwrap(),
+        q.entry_fees().checked_add(q.estimated_exit_fees()).unwrap(),
         Cash::parse("1.9").unwrap()
     );
 }
@@ -264,8 +350,8 @@ fn quantity_is_equal_on_both_legs_and_rounded_down() {
     );
     let b = book(Venue::Dydx, &[("102.99", "100")], &[("103.01", "100")]);
     let q = quote_pair(&a, &b, request(None)).unwrap();
-    assert_eq!(q.quantity, Quantity::parse("9.708").unwrap());
-    assert_eq!(q.long_buy.quantity, q.short_sell.quantity);
+    assert_eq!(q.quantity(), Quantity::parse("9.708").unwrap());
+    assert_eq!(q.long_buy().quantity(), q.short_sell().quantity());
     assert!(quote_pair(&a, &b, request(Some("0.000001"))).is_err());
 }
 #[test]
@@ -371,7 +457,7 @@ fn closing_trade_reconciles_gross_fees_and_net() {
     let b = book(Venue::Dydx, &[("100.39", "100")], &[("100.41", "100")]);
     let entry = quote_pair(&a, &b, request(Some("10"))).unwrap();
     let exit = quote_pair(&a, &flat(Venue::Dydx), request(Some("10"))).unwrap();
-    let result = entry.paper_open().mark_close(&exit).unwrap();
+    let result = entry.paper_open().mark_close(&exit.exit_quote()).unwrap();
     assert_eq!(result.gross, Cash::parse("3.6").unwrap());
     assert_eq!(result.fees, Cash::parse("1.902").unwrap());
     assert_eq!(result.net, Cash::parse("1.698").unwrap());
@@ -392,7 +478,7 @@ fn closing_fee_rate_can_change_after_entry() {
         },
     )
     .unwrap();
-    let result = entry.paper_open().mark_close(&exit).unwrap();
+    let result = entry.paper_open().mark_close(&exit.exit_quote()).unwrap();
     assert_eq!(result.fees, Cash::parse("1.149995").unwrap());
 }
 #[test]
@@ -404,7 +490,7 @@ fn instant_round_trip_loses_spread_and_fees() {
     )
     .unwrap();
     assert_eq!(
-        q.paper_open().mark_close(&q).unwrap().net,
+        q.paper_open().mark_close(&q.exit_quote()).unwrap().net,
         Cash::parse("-2.3").unwrap()
     );
 }
@@ -415,11 +501,15 @@ fn closing_a_different_quantity_or_direction_fails() {
     let entry = quote_pair(&a, &b, request(Some("10"))).unwrap();
     assert!(entry
         .paper_open()
-        .mark_close(&quote_pair(&a, &b, request(Some("9"))).unwrap())
+        .mark_close(&quote_pair(&a, &b, request(Some("9"))).unwrap().exit_quote())
         .is_err());
     assert!(entry
         .paper_open()
-        .mark_close(&quote_pair(&b, &a, request(Some("10"))).unwrap())
+        .mark_close(
+            &quote_pair(&b, &a, request(Some("10")))
+                .unwrap()
+                .exit_quote()
+        )
         .is_err());
 }
 #[test]
@@ -432,15 +522,10 @@ fn invalid_inputs_are_rejected_without_silent_rounding() {
     assert!(Ema::new(1, 0).is_err());
 }
 #[test]
-fn zero_size_and_invalid_fill_display_are_errors() {
+fn zero_trade_size_is_an_error() {
     assert!(flat(Venue::Dydx)
         .walk(Side::Buy, Quantity::parse("0").unwrap())
         .is_err());
-    let fill = Fill {
-        quantity: Quantity::parse("0").unwrap(),
-        notional: Cash::parse("0").unwrap(),
-    };
-    assert!(fill.vwap_string().is_err());
 }
 #[test]
 fn arithmetic_overflow_returns_error_instead_of_wrapping() {

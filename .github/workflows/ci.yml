@@ -28,6 +28,8 @@ jobs:
         run: cargo +stable clippy --locked --offline --all-targets -- -D warnings
       - name: Run Rust tests
         run: cargo +stable test --locked --offline --all-targets
+      - name: Check quote and fill immutability
+        run: cargo +stable test --locked --offline --doc
       - name: Build release binary
         run: cargo +stable build --locked --offline --release
       - name: Compare with independent Python Decimal reference

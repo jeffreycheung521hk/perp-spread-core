@@ -1,6 +1,6 @@
 # TSV calculator protocol
 
-Run `cargo run --locked --offline` without `--demo`. Each input line produces exactly one output line, with no header. The process remains alive after a malformed request. This interface is intended for batching and cross-language verification, not low-latency order submission.
+Run `cargo run --locked --offline` without `--demo`. Every input record produces exactly one newline-terminated output record, with no header. Empty lines return `unknown\tERR\tempty request`. Non-UTF-8 lines return `unknown\tERR\tinvalid UTF-8 input`; subsequent valid lines are still processed. LF and CRLF are accepted, as is a final nonempty record without a newline. An empty stream contains zero records. Transport I/O failures remain fatal. This interface is for batching and cross-language verification, not low-latency order submission.
 
 All decimal values are strings, not binary floating-point numbers. Input contains exactly 17 tab-separated fields:
 
@@ -9,7 +9,7 @@ All decimal values are strings, not binary floating-point numbers. Input contain
 | 0 | Request ID | `case-1` |
 | 1 | Long venue (the other is short) | `hyperliquid` or `dydx` |
 | 2 | Base quantity, or auto sizing | `10` or `auto` |
-| 3 | Single-leg USD reference sizing budget | `1000` |
+| 3 | Single-leg USD reference budget; used only for `auto` | `1000` (or `0` for fixed size) |
 | 4 | Quantity step | `0.001` |
 | 5 | Long venue taker fee in bps | `4.5` |
 | 6 | Short venue taker fee in bps | `5` |
@@ -24,7 +24,7 @@ All decimal values are strings, not binary floating-point numbers. Input contain
 | 15 | Short book bids | `100.39@100` |
 | 16 | Short book asks | `100.41@100` |
 
-Levels are `price@size` pairs separated by commas. `-` represents an empty side, which is rejected as an invalid book. Each request is a full snapshot; use the Rust library directly for incremental updates. The same configured quantity step is applied to both legs. Actual exchange contract/tick/lot rules must be checked by an adapter.
+Levels are `price@size` pairs separated by commas. `-` represents an empty side; the CLI still requires both sides to calculate a four-fill pair quote. Duplicate prices in a snapshot side are errors. Each request is a full snapshot; use the library for incremental updates or the separate two-fill `quote_exit` API. The same entry quantity step applies to both legs. Actual exchange contract/tick/lot rules must be checked by an adapter. Fixed quantity uses `Sizing::Fixed` and ignores the unused budget column; auto size still requires a valid positive budget.
 
 Successful output has these 17 fields:
 
