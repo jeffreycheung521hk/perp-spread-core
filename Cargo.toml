@@ -3,6 +3,7 @@ name = "perp-spread-core"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
+license = "MIT"
 description = "Deterministic order-book and cost analysis for cross-exchange perpetual futures research"
 
 [lib]

@@ -101,3 +101,7 @@ python3 scripts/check_python_parity.py --binary target/release/spread-core
 ```
 
 GitHub Actions runs these checks on pushes to `main` and on pull requests. The Python reference verifies quote arithmetic and filters; it is not a full replay of the previous Python paper-trading engine. Rust regression tests separately cover EMA ordering and hypothetical trade reconciliation.
+
+## License
+
+Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Jeffrey Cheung.
