@@ -124,43 +124,119 @@ fn crossed_updates_keep_depth_and_recover_using_deltas() {
     assert!(b.walk(Side::Buy, Quantity::parse("1").unwrap()).is_ok());
 }
 #[test]
-fn duplicate_ids_are_ignored_and_older_sources_are_rejected_without_data_loss() {
-    for (old, new, expected) in [
-        (
+fn duplicate_ids_are_ignored_without_data_loss_or_freshness_extension() {
+    let mut b = OrderBook::new(Venue::Dydx);
+    b.apply(
+        true,
+        &[Level::parse("99", "1").unwrap()],
+        &[Level::parse("101", "1").unwrap()],
+        UpdateMeta {
+            message_id: Some(2),
+            source_ms: Some(200),
+            ..meta(1000)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        b.apply(
+            false,
+            &[],
+            &[Level::parse("101", "0").unwrap()],
             UpdateMeta {
                 message_id: Some(2),
-                ..meta(1000)
-            },
-            UpdateMeta {
-                message_id: Some(2),
-                ..meta(1001)
-            },
-            Ok(UpdateOutcome::Ignored),
-        ),
-        (
-            UpdateMeta {
-                source_ms: Some(200),
-                ..meta(1000)
-            },
-            UpdateMeta {
                 source_ms: Some(100),
-                ..meta(1001)
-            },
-            Err(CoreError::OutOfOrder),
+                ..meta(999)
+            }
         ),
+        Ok(UpdateOutcome::Ignored)
+    );
+    assert_eq!(b.meta().unwrap().received_ms, 1000);
+    assert_eq!(b.source_watermark_ms(), Some(200));
+    assert_eq!(b.state(), BookState::Synced);
+    assert!(b.walk(Side::Buy, Quantity::parse("1").unwrap()).is_ok());
+}
+#[test]
+fn time_rejected_snapshots_preserve_the_synced_book_and_watermarks() {
+    for rejected in [
+        UpdateMeta {
+            message_id: Some(1),
+            source_ms: Some(100),
+            ..meta(1001)
+        },
+        UpdateMeta {
+            message_id: Some(1),
+            source_ms: Some(201),
+            ..meta(999)
+        },
     ] {
         let mut b = OrderBook::new(Venue::Dydx);
         b.apply(
             true,
             &[Level::parse("99", "1").unwrap()],
             &[Level::parse("101", "1").unwrap()],
-            old,
+            UpdateMeta {
+                message_id: Some(2),
+                source_ms: Some(200),
+                ..meta(1000)
+            },
         )
         .unwrap();
-        assert_eq!(b.apply(false, &[], &[], new), expected);
+        assert_eq!(
+            b.apply(
+                true,
+                &[Level::parse("50", "1").unwrap()],
+                &[Level::parse("51", "1").unwrap()],
+                rejected
+            ),
+            Err(CoreError::OutOfOrder)
+        );
         assert_eq!(b.meta().unwrap().received_ms, 1000);
         assert_eq!(b.state(), BookState::Synced);
+        assert_eq!(b.source_watermark_ms(), Some(200));
+        assert_eq!(b.best().unwrap().0, Price::parse("99").unwrap());
+        assert_eq!(
+            b.apply(
+                false,
+                &[],
+                &[],
+                UpdateMeta {
+                    message_id: Some(3),
+                    source_ms: Some(202),
+                    ..meta(1002)
+                }
+            ),
+            Ok(UpdateOutcome::Applied)
+        );
     }
+}
+#[test]
+fn source_time_rejected_deltas_require_snapshot_but_keep_watermarks() {
+    let mut b = OrderBook::new(Venue::Dydx);
+    b.apply(
+        true,
+        &[Level::parse("99", "1").unwrap()],
+        &[Level::parse("101", "1").unwrap()],
+        UpdateMeta {
+            source_ms: Some(200),
+            ..meta(1000)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        b.apply(
+            false,
+            &[],
+            &[Level::parse("101", "0").unwrap()],
+            UpdateMeta {
+                source_ms: Some(100),
+                ..meta(1001)
+            }
+        ),
+        Err(CoreError::OutOfOrder)
+    );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.source_watermark_ms(), Some(200));
+    assert_eq!(b.best(), Err(CoreError::MissingSnapshot));
 }
 #[test]
 fn backwards_local_time_is_rejected() {
@@ -169,6 +245,8 @@ fn backwards_local_time_is_rejected() {
         b.apply(false, &[], &[], meta(999)),
         Err(CoreError::OutOfOrder)
     );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.meta().unwrap_err(), CoreError::MissingSnapshot);
 }
 #[test]
 fn source_order_check_survives_messages_with_missing_source_time() {
@@ -196,6 +274,8 @@ fn source_order_check_survives_messages_with_missing_source_time() {
         ),
         Err(CoreError::OutOfOrder)
     );
+    assert_eq!(b.state(), BookState::NeedsSnapshot);
+    assert_eq!(b.source_watermark_ms(), Some(200));
 }
 #[test]
 fn only_twenty_levels_are_executable() {

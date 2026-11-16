@@ -131,7 +131,9 @@ impl OrderBook {
     /// A validated snapshot starts a new sequence, even when its ID is None.
     /// Old/duplicate delta IDs are ignored without refreshing timestamps.
     /// Crossed depth is retained; quote methods stay disabled until it uncrosses.
-    /// Errors leave the previously accepted book and watermarks unchanged.
+    /// Rejected snapshots preserve the last accepted book. Time-rejected deltas
+    /// require a new snapshot because their depth changes may have been missed.
+    /// Source/arrival watermarks survive that invalidation.
     pub fn apply(
         &mut self,
         snapshot: bool,
@@ -158,6 +160,9 @@ impl OrderBook {
                 .zip(meta.source_ms)
                 .is_some_and(|(a, b)| b < a)
         {
+            if !snapshot {
+                self.invalidate();
+            }
             return Err(CoreError::OutOfOrder);
         }
         if snapshot {
